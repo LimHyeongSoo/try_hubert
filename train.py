@@ -108,7 +108,7 @@ def train(rank, world_size, args):
     hubert = HubertEEModel(hf_model, ee_layers=ee_layers, vocab_size=vocab_size).to(rank)
 
     optimizer = optim.AdamW(
-        hubert.parameters(),
+        hubert.early_exit_branches.parameters(),  # Early Exit Branch만 학습
         lr=LEARNING_RATE,
         betas=BETAS,
         eps=EPS,
@@ -157,9 +157,7 @@ def train(rank, world_size, args):
     for p in hubert.early_exit_branches.parameters():
         p.requires_grad = True
 
-    hubert = DDP(hubert, device_ids=[rank], find_unused_parameters=True)
-    # Optional: Static graph 설정
-    # hubert._set_static_graph()
+    hubert = DDP(hubert, device_ids=[rank], find_unused_parameters=False)
 
     branch_count = len(ee_layers)
     branch_idx = 0  # 현재 선택된 branch 인덱스
@@ -168,7 +166,6 @@ def train(rank, world_size, args):
         train_sampler.set_epoch(epoch)
         hubert.train()
         train_loss_metric = Metric()
-        val_loss_metric = Metric()
 
         for wavs, targets in train_loader:
             global_step += 1
@@ -180,12 +177,10 @@ def train(rank, world_size, args):
             with amp.autocast():
                 _, all_layer_outputs = hubert(wavs)
                 ee_logits_list = hubert.module.early_exit_outputs(all_layer_outputs)
-                ee_ctc_losses = [compute_ctc_loss(ee_logits, targets) for ee_logits in ee_logits_list]
+                selected_logits = ee_logits_list[branch_idx]
+                selected_loss = compute_ctc_loss(selected_logits, targets)
 
-            # 한 번에 하나의 Branch Loss만 Backward
-            selected_loss = ee_ctc_losses[branch_idx]
             scaler.scale(selected_loss).backward()
-
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(hubert.parameters(), MAX_NORM)
             scaler.step(optimizer)
@@ -202,34 +197,21 @@ def train(rank, world_size, args):
 
             if global_step % VALIDATION_INTERVAL == 0:
                 hubert.eval()
-                val_loss_metric.reset()
+                val_loss_metric = Metric()
                 with torch.no_grad():
                     for wavs_val, targets_val in validation_loader:
                         wavs_val, targets_val = wavs_val.to(rank), targets_val.to(rank)
                         _, all_layer_outputs_val = hubert(wavs_val)
                         ee_logits_list_val = hubert.module.early_exit_outputs(all_layer_outputs_val)
-                        # 모든 Branch 중 하나만 선택하여 Loss 계산
-                        selected_logits = ee_logits_list_val[0]  # 첫 번째 Branch 사용
-                        best_entropy = float("inf")
-                        chosen_name = "ee_branch_0"
-
-                        for i, cand in enumerate(ee_logits_list_val):
-                            log_probs = F.log_softmax(cand, dim=-1)
-                            probs = log_probs.exp()
-                            entropy = -(probs * log_probs).sum(dim=-1).mean().item()
-                            if entropy < best_entropy:
-                                best_entropy = entropy
-                                selected_logits = cand
-                                chosen_name = f"ee_branch_{i}"
-
-                        val_loss = compute_ctc_loss(selected_logits, targets_val)
+                        selected_logits_val = ee_logits_list_val[0]  # 첫 번째 Branch 사용
+                        val_loss = compute_ctc_loss(selected_logits_val, targets_val)
                         val_loss_metric.update(val_loss.item())
 
                 hubert.train()
 
                 if rank == 0:
                     writer.add_scalar("validation/ctc_loss", val_loss_metric.value, global_step)
-                    logger.info(f"valid -- epoch: {epoch}, ctc_loss: {val_loss_metric.value:.4f}, entropy: {best_entropy}, chosen_branch: {chosen_name}")
+                    logger.info(f"valid -- epoch: {epoch}, ctc_loss: {val_loss_metric.value:.4f}")
 
                 new_best = best_loss > val_loss_metric.value
                 if new_best or global_step % CHECKPOINT_INTERVAL == 0:
@@ -272,14 +254,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--warmstart",
-        help="not used now, huggingface model loaded from local pretrained",
-        action="store_true",
+        help="whether to initialize from the pretrained checkpoint.",
+        action="store_true",  # 옵션을 플래그로 사용
     )
+
     parser.add_argument(
         "--mask",
         help="whether to use input masking.",
-        action="store_true",
+        action="store_true",  # 옵션을 플래그로 사용
     )
+
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()
