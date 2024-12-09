@@ -15,6 +15,11 @@ from hubert.utils import compute_entropy, should_early_exit, ENTROPY_THRESHOLD
 # hubconf.py에서 hubert_ee 함수 import
 from hubconf import hubert_ee
 
+
+#####################
+#### 추론 스크립트 ######
+#####################
+
 def encode_dataset(args):
     print("Loading HuBERT-EE checkpoint")
     hubert = hubert_ee(args.pretrained_path, vocab_size=args.vocab_size, ee_layers=[4,7,10]).cuda()

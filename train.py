@@ -1,7 +1,7 @@
-# train.py
 import argparse
 import logging
 from pathlib import Path
+import time  # 시간 추적을 위한 모듈
 
 import torch
 import torch.cuda.amp as amp
@@ -16,27 +16,32 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from transformers import HubertForCTC
-from hubert.dataset import ASRDataset  # 사용자 dataset.py 수정 버전
-from hubert.utils import Metric, save_checkpoint, load_checkpoint, ENTROPY_THRESHOLD
-from hubert.model import EarlyExitBranch
+from hubert.dataset import ASRDataset
+from hubert.utils import Metric, save_checkpoint, load_checkpoint
+from hubert.model import HubertEEModel  # 변경된 model.py에서 가져옴
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 32
-LEARNING_RATE = 2e-5
+# 하이퍼파라미터 및 설정
+BATCH_SIZE = 16
+LEARNING_RATE = 2e-4  # 초기 학습률을 기존보다 크게 설정
 BETAS = (0.9, 0.98)
 EPS = 1e-06
 WEIGHT_DECAY = 1e-2
 MAX_NORM = 10
-STEPS = 25000
 LOG_INTERVAL = 5
 VALIDATION_INTERVAL = 1000
 CHECKPOINT_INTERVAL = 5000
 BACKEND = "nccl"
-INIT_METHOD = "tcp://localhost:54321"
+INIT_METHOD = "tcp://127.0.0.1:54321"
+
+FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final")  # 최종 모델 저장 경로
+
+N_EPOCHS = 5  # 고정된 에폭 수
 
 def compute_ctc_loss(logits, targets):
+    """CTC Loss 계산 함수."""
     with torch.no_grad():
         input_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device)
         target_lengths = (targets != -1).sum(dim=-1)
@@ -51,37 +56,16 @@ def compute_ctc_loss(logits, targets):
     )
     return loss
 
-class HubertEEModel(nn.Module):
-    def __init__(self, model: HubertForCTC, ee_layers=[4,7,10], vocab_size=50):
-        super().__init__()
-        self.model = model
-        self.model.config.output_hidden_states = True
-        self.ee_layers = ee_layers
-        # HuggingFace 모델 hidden state 차원: 1024
-        self.early_exit_branches = nn.ModuleList([
-            EarlyExitBranch(embed_dim=1024, ee_dim=512, vocab_size=vocab_size, num_heads=4, ff_hidden=1024, dropout=0.1)
-            for _ in ee_layers
-        ])
-
-    def forward(self, wavs):
-        # wavs: (B,1,T)
-        out = self.model(wavs, output_hidden_states=True)
-        # out.hidden_states: layer0 ~ layerN (총 25개: 1개 feature projection 전 + 24개 레이어)
-        # huggingface Huberts: hidden_states[0] = after feature encoder?
-        # 실제로 HubertForCTC doc 참고 필요
-        # 여기서는 hidden_states[1:]가 레이어별 출력이라 가정
-        all_layer_outputs = out.hidden_states[1:]
-        return out.logits, all_layer_outputs
-
-    def early_exit_outputs(self, all_layer_outputs):
-        ee_logits_list = []
-        for i, ee_idx in enumerate(self.ee_layers):
-            ee_x = all_layer_outputs[ee_idx] # (B,T,1024)
-            ee_logits = self.early_exit_branches[i](ee_x)
-            ee_logits_list.append(ee_logits)
-        return ee_logits_list
+def format_time(seconds):
+    """시간을 hh:mm:ss 형식으로 포맷하는 함수."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 def train(rank, world_size, args):
+    """멀티 GPU 학습 함수."""
+    # 분산 학습 초기화
     dist.init_process_group("nccl", rank=rank, world_size=world_size, init_method=INIT_METHOD)
 
     # Logging 설정
@@ -101,14 +85,22 @@ def train(rank, world_size, args):
     writer = SummaryWriter(log_dir) if rank == 0 else None
 
     # 모델 초기화
-    model_path = "/data1/hslim/PycharmProjects/hubert/models"
-    hf_model = HubertForCTC.from_pretrained(model_path)
+    hf_model = HubertForCTC.from_pretrained(args.pretrained_path)
     vocab_size = hf_model.lm_head.out_features
     ee_layers = [4, 7, 10]
     hubert = HubertEEModel(hf_model, ee_layers=ee_layers, vocab_size=vocab_size).to(rank)
 
+    # 모델의 Transformer 인코더를 Freeze
+    for param in hubert.model.parameters():
+        param.requires_grad = False
+
+    # DDP로 감싸기
+    hubert = DDP(hubert, device_ids=[rank], find_unused_parameters=True)
+    hubert._set_static_graph()  # 그래프 고정
+
+    # 옵티마이저 및 Gradient Scaler 설정
     optimizer = optim.AdamW(
-        hubert.early_exit_branches.parameters(),  # Early Exit Branch만 학습
+        hubert.module.early_exit_branches.parameters(),
         lr=LEARNING_RATE,
         betas=BETAS,
         eps=EPS,
@@ -116,11 +108,21 @@ def train(rank, world_size, args):
     )
     scaler = amp.GradScaler()
 
+    # 학습률 스케줄러 설정 (StepLR 사용)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)  # 2 에폭마다 학습률을 0.1배로 감소
+
     # 데이터셋 로드
     dict_path = args.dataset_dir / "train-clean-dict.ltr.txt"
     tsv_path = args.dataset_dir / "tsv_file_with_nsample.tsv"
     ltr_path = args.dataset_dir / "train-clean-100.ltr"
-    train_dataset = ASRDataset(root=args.dataset_dir, tsv_path=tsv_path, ltr_path=ltr_path, dict_path=dict_path, train=True)
+
+    train_dataset = ASRDataset(
+        root=args.dataset_dir,
+        tsv_path=tsv_path,
+        ltr_path=ltr_path,
+        dict_path=dict_path,
+        train=True,
+    )
     train_sampler = DistributedSampler(train_dataset, drop_last=True)
     train_loader = DataLoader(
         train_dataset,
@@ -132,144 +134,97 @@ def train(rank, world_size, args):
         drop_last=True,
     )
 
-    dev_tsv_path = args.dataset_dir / "dev_tsv_file_with_nsample.tsv"
-    dev_ltr_path = args.dataset_dir / "dev-clean.ltr"
-    validation_dataset = ASRDataset(root=args.dataset_dir, tsv_path=dev_tsv_path, ltr_path=dev_ltr_path,
-                                    dict_path=dict_path, train=False)
-    validation_loader = DataLoader(
-        validation_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-    )
-
-    # Early Exit Branch 학습
+    # 학습 준비
     global_step, best_loss = 0, float("inf")
-    n_epochs = STEPS // len(train_loader) + 1
-    start_epoch = global_step // len(train_loader) + 1
+    n_epochs = N_EPOCHS  # 고정된 에폭 수
+    start_epoch = 1  # 에폭 1부터 시작
 
-    # 백본 모델 동결
-    for p in hubert.model.parameters():
-        p.requires_grad = False
+    total_batches = len(train_loader)  # 에폭당 총 배치 수
 
-    # Early Exit Branch만 학습
-    for p in hubert.early_exit_branches.parameters():
-        p.requires_grad = True
-
-    hubert = DDP(hubert, device_ids=[rank], find_unused_parameters=False)
-
-    branch_count = len(ee_layers)
-    branch_idx = 0  # 현재 선택된 branch 인덱스
+    if rank == 0:
+        start_time = time.time()
+        batch_counter = 0
 
     for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
         hubert.train()
         train_loss_metric = Metric()
 
-        for wavs, targets in train_loader:
+        for batch_idx, (wavs, targets) in enumerate(train_loader, 1):
             global_step += 1
             wavs, targets = wavs.to(rank), targets.to(rank)
-            wavs = wavs.squeeze(1)  # (B,T)
+            wavs = wavs.squeeze(1)
 
             optimizer.zero_grad()
 
             with amp.autocast():
                 _, all_layer_outputs = hubert(wavs)
                 ee_logits_list = hubert.module.early_exit_outputs(all_layer_outputs)
-                selected_logits = ee_logits_list[branch_idx]
-                selected_loss = compute_ctc_loss(selected_logits, targets)
 
-            scaler.scale(selected_loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(hubert.parameters(), MAX_NORM)
-            scaler.step(optimizer)
+                # Early Exit Branch 손실 계산
+                losses = [compute_ctc_loss(logits, targets) for logits in ee_logits_list]
+                total_loss = sum(losses) / len(losses)  # 손실의 평균 계산
+
+            scaler.scale(total_loss).backward()  # 역전파
+            nn.utils.clip_grad_norm_(hubert.parameters(), MAX_NORM)  # Gradient 클리핑
+            scaler.step(optimizer)  # 매개변수 업데이트
             scaler.update()
 
-            train_loss_metric.update(selected_loss.item())
+            train_loss_metric.update(total_loss.item())
 
-            # Branch 인덱스 업데이트 (Round-Robin 방식)
-            branch_idx = (branch_idx + 1) % branch_count
+            if rank == 0:
+                # 시간 추적 및 로깅
+                batch_counter += 1
+                elapsed_time = time.time() - start_time
+                average_time_per_batch = elapsed_time / batch_counter
+                remaining_batches = (n_epochs - epoch) * total_batches + (total_batches - batch_idx)
+                remaining_time = remaining_batches * average_time_per_batch
+                formatted_remaining_time = format_time(remaining_time)
+                current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-            if rank == 0 and global_step % LOG_INTERVAL == 0:
-                writer.add_scalar("train/ctc_loss", train_loss_metric.value, global_step)
-                train_loss_metric.reset()
+                # 현재 학습률 가져오기
+                current_lr = optimizer.param_groups[0]['lr']
 
-            if global_step % VALIDATION_INTERVAL == 0:
-                hubert.eval()
-                val_loss_metric = Metric()
-                with torch.no_grad():
-                    for wavs_val, targets_val in validation_loader:
-                        wavs_val, targets_val = wavs_val.to(rank), targets_val.to(rank)
-                        _, all_layer_outputs_val = hubert(wavs_val)
-                        ee_logits_list_val = hubert.module.early_exit_outputs(all_layer_outputs_val)
-                        selected_logits_val = ee_logits_list_val[0]  # 첫 번째 Branch 사용
-                        val_loss = compute_ctc_loss(selected_logits_val, targets_val)
-                        val_loss_metric.update(val_loss.item())
+                logger.info(
+                    f"Epoch [{epoch}/{n_epochs}] Batch [{batch_idx}/{total_batches}] | "
+                    f"Time: {current_time_str} | Remaining Time: {formatted_remaining_time} | "
+                    f"Loss: {total_loss.item():.4f} | LR: {current_lr:.6f}"
+                )
 
-                hubert.train()
+                # TensorBoard 로깅
+                if global_step % LOG_INTERVAL == 0:
+                    writer.add_scalar("train/ctc_loss", train_loss_metric.value, global_step)
+                    train_loss_metric.reset()
 
-                if rank == 0:
-                    writer.add_scalar("validation/ctc_loss", val_loss_metric.value, global_step)
-                    logger.info(f"valid -- epoch: {epoch}, ctc_loss: {val_loss_metric.value:.4f}")
+        if rank == 0:
+            # 에폭이 끝난 후 학습률 스케줄러 업데이트
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.info(f"Epoch [{epoch}/{n_epochs}] completed. Average Loss: {train_loss_metric.value:.4f} | LR: {current_lr:.6f}")
 
-                new_best = best_loss > val_loss_metric.value
-                if new_best or global_step % CHECKPOINT_INTERVAL == 0:
-                    if new_best:
-                        best_loss = val_loss_metric.value
-                    if rank == 0:
-                        save_checkpoint(
-                            checkpoint_dir=args.checkpoint_dir,
-                            hubert=hubert,
-                            optimizer=optimizer,
-                            scaler=scaler,
-                            step=global_step,
-                            loss=val_loss_metric.value,
-                            best=new_best,
-                            logger=logger,
-                        )
+    # 최종 모델 저장
+    if rank == 0:
+        FINAL_MODEL_PATH.mkdir(parents=True, exist_ok=True)
+        save_checkpoint(
+            checkpoint_dir=FINAL_MODEL_PATH,
+            hubert=hubert,
+            optimizer=optimizer,
+            scaler=scaler,
+            step=global_step,
+            loss=train_loss_metric.value,
+            best=False,
+            logger=logger,
+        )
+        logger.info(f"Final model checkpoint saved to {FINAL_MODEL_PATH}.")
 
-        logger.info(f"train -- epoch: {epoch}, done")
-
-    dist.destroy_process_group()
+    dist.destroy_process_group()  # 분산 학습 종료
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train HuBERT-EE for ASR with huggingface model.")
-    parser.add_argument(
-        "dataset_dir",
-        metavar="dataset-dir",
-        help="path to the data directory.",
-        type=Path,
-    )
-    parser.add_argument(
-        "checkpoint_dir",
-        metavar="checkpoint-dir",
-        help="path to the checkpoint directory.",
-        type=Path,
-    )
-    parser.add_argument(
-        "--resume",
-        help="path to the checkpoint to resume from.",
-        type=Path,
-    )
-    parser.add_argument(
-        "--warmstart",
-        help="whether to initialize from the pretrained checkpoint.",
-        action="store_true",  # 옵션을 플래그로 사용
-    )
-
-    parser.add_argument(
-        "--mask",
-        help="whether to use input masking.",
-        action="store_true",  # 옵션을 플래그로 사용
-    )
-
+    parser = argparse.ArgumentParser(description="Train HuBERT-EE for ASR.")
+    parser.add_argument("dataset_dir", type=Path, help="Path to the data directory.")
+    parser.add_argument("checkpoint_dir", type=Path, help="Path to the checkpoint directory.")
+    parser.add_argument("--pretrained_path", type=Path, required=True, help="Path to the pretrained model.")
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()
-    mp.spawn(
-        train,
-        args=(world_size, args),
-        nprocs=world_size,
-        join=True,
-    )
+    mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
