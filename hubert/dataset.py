@@ -1,4 +1,4 @@
-# dataset.py
+# hubert/dataset.py
 import random
 from pathlib import Path
 import torch
@@ -24,7 +24,7 @@ class ASRDataset(Dataset):
         self.max_samples = max_samples
         self.train = train
 
-        # char_dict 로드
+        # char_dict 로드 (문자 -> 인덱스)
         self.char_dict = {}
         with open(dict_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
@@ -45,7 +45,7 @@ class ASRDataset(Dataset):
             if nsamples > self.min_samples:  # 길이 필터링 (옵션)
                 self.audio_list.append((wav_path, nsamples))
 
-        # ltr 파일 로드
+        # ltr 파일 로드 (utt_id -> transcript)
         self.ltr_dict = {}
         with open(ltr_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -74,7 +74,7 @@ class ASRDataset(Dataset):
             wav = wav[:, offset:offset+self.max_samples]
 
         utt_id = wav_path.stem  # 예: 8629-261140-0005 형태
-        transcript = self.ltr_dict[utt_id]
+        transcript = self.ltr_dict.get(utt_id, "")
         targets = []
         for ch in transcript:
             if ch in self.char_dict:
@@ -83,10 +83,10 @@ class ASRDataset(Dataset):
             #   만약 사전에 없는 문자를 어떻게 처리할지 결정 필요. 여기서는 무시.
 
         targets = torch.tensor(targets, dtype=torch.long)
-        return wav, targets
+        return wav, targets, transcript  # (wav, targets, transcript)
 
     def collate(self, batch):
-        wavs, targets = zip(*batch)
+        wavs, targets, transcripts = zip(*batch)
         max_wav_len = max(w.size(-1) for w in wavs)
         coll_wavs = []
         for w in wavs:
@@ -100,4 +100,4 @@ class ASRDataset(Dataset):
         for i, t in enumerate(targets):
             coll_targets[i, :t.size(0)] = t
 
-        return coll_wavs, coll_targets
+        return coll_wavs, coll_targets, list(transcripts)  # (B,1,T), (B, max_tgt_len), [transcripts]

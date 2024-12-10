@@ -1,3 +1,5 @@
+# train.py
+
 import argparse
 import logging
 from pathlib import Path
@@ -17,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from transformers import HubertForCTC
 from hubert.dataset import ASRDataset
-from hubert.utils import Metric, save_checkpoint, load_checkpoint
+from hubert.utils import Metric, save_checkpoint, load_checkpoint, wer, decode_predictions, load_vocab
 from hubert.model import HubertEEModel  # 변경된 model.py에서 가져옴
 
 logging.basicConfig(level=logging.INFO)
@@ -36,9 +38,9 @@ CHECKPOINT_INTERVAL = 5000
 BACKEND = "nccl"
 INIT_METHOD = "tcp://127.0.0.1:54321"
 
-FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final/3")  # 최종 모델 저장 경로
+FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final/4")  # 최종 모델 저장 경로
 
-N_EPOCHS = 1  # 고정된 에폭 수
+N_EPOCHS = 1  # 고정된 에폭 수로 증가
 
 def compute_ctc_loss(logits, targets):
     """CTC Loss 계산 함수."""
@@ -61,6 +63,39 @@ def format_time(seconds):
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+def calculate_wer(model, dataloader, vocab, device):
+    """
+    WER을 계산하는 함수.
+    model: 학습된 모델
+    dataloader: 검증 데이터 로더
+    vocab: 인덱스-문자 매핑 딕셔너리
+    device: 디바이스 (CPU 또는 GPU)
+    """
+    model.eval()
+    wer_metric = Metric()
+    with torch.no_grad():
+        for batch_idx, (wavs, targets, transcripts) in enumerate(dataloader, 1):
+            wavs = wavs.to(device)
+            wavs = wavs.squeeze(1)  # [B,1,T] -> [B,T]
+
+            # 모델 예측
+            logits, _ = model(wavs)
+            pred_ids = torch.argmax(logits, dim=-1).cpu().numpy()
+
+            # 예측 텍스트 디코딩
+            pred_texts = decode_predictions(pred_ids, vocab)
+
+            # 참조 텍스트
+            target_texts = transcripts
+
+            # WER 계산
+            for pred, ref in zip(pred_texts, target_texts):
+                wer_value = wer(pred, ref)
+                wer_metric.update(wer_value)
+
+    average_wer = wer_metric.value / wer_metric.steps if wer_metric.steps > 0 else 0.0
+    return average_wer
 
 def train(rank, world_size, args):
     """멀티 GPU 학습 함수."""
@@ -156,6 +191,9 @@ def train(rank, world_size, args):
         drop_last=False,
     )
 
+    # 어휘 사전 로드
+    vocab = load_vocab(val_dict_path)  # 검증 시 사용한 dict 파일 로드
+
     # 학습 준비
     global_step, best_loss = 0, float("inf")
     n_epochs = N_EPOCHS  # 고정된 에폭 수
@@ -172,7 +210,7 @@ def train(rank, world_size, args):
         hubert.train()
         train_loss_metric = Metric()
 
-        for batch_idx, (wavs, targets) in enumerate(train_loader, 1):
+        for batch_idx, (wavs, targets, _) in enumerate(train_loader, 1):  # 수정된 부분: transcript 무시
             global_step += 1
             wavs, targets = wavs.to(rank), targets.to(rank)
             wavs = wavs.squeeze(1)
@@ -218,12 +256,12 @@ def train(rank, world_size, args):
                     writer.add_scalar("train/ctc_loss", train_loss_metric.value, global_step)
                     train_loss_metric.reset()
 
-            # VALIDATION_INTERVAL마다 검증 수행
+            # VALIDATION_INTERVAL마다 검증 수행 및 WER 계산
             if rank == 0 and global_step % VALIDATION_INTERVAL == 0:
                 hubert.eval()
                 val_loss_metric = Metric()
                 with torch.no_grad():
-                    for val_batch_idx, (val_wavs, val_targets) in enumerate(val_loader, 1):
+                    for val_batch_idx, (val_wavs, val_targets, _) in enumerate(val_loader, 1):  # transcript 무시
                         val_wavs, val_targets = val_wavs.to(rank), val_targets.to(rank)
                         val_wavs = val_wavs.squeeze(1)
 
@@ -233,19 +271,23 @@ def train(rank, world_size, args):
                         # Early Exit Branch 손실 계산
                         val_losses = [compute_ctc_loss(logits, val_targets) for logits in val_ee_logits_list]
                         val_total_loss = sum(val_losses) / len(val_losses)
-
                         val_loss_metric.update(val_total_loss.item())
 
                 average_val_loss = val_loss_metric.value / len(val_loader)
                 logger.info(f"Validation at step {global_step}: Average Loss: {average_val_loss:.4f}")
                 writer.add_scalar("validation/ctc_loss", average_val_loss, global_step)
 
+                # WER 계산
+                wer_value = calculate_wer(hubert, val_loader, vocab, rank)
+                logger.info(f"Validation at step {global_step}: WER: {wer_value:.2f}%")
+                writer.add_scalar("validation/wer", wer_value, global_step)
+
                 # 최적의 검증 손실 업데이트 및 체크포인트 저장
                 if average_val_loss < best_loss:
                     best_loss = average_val_loss
                     save_checkpoint(
                         checkpoint_dir=FINAL_MODEL_PATH,
-                        hubert=hubert,
+                        hubert=hubert.module,  # DDP 래핑된 모델 대신 원본 모델 저장
                         optimizer=optimizer,
                         scaler=scaler,
                         step=global_step,
@@ -263,12 +305,18 @@ def train(rank, world_size, args):
             current_lr = optimizer.param_groups[0]['lr']
             logger.info(f"Epoch [{epoch}/{n_epochs}] completed. Average Loss: {train_loss_metric.value:.4f} | LR: {current_lr:.6f}")
 
+    # 에폭이 끝난 후 최종 WER 계산 (선택 사항)
+    if rank == 0:
+        final_wer = calculate_wer(hubert, val_loader, vocab, rank)
+        logger.info(f"Final WER after training: {final_wer:.2f}%")
+        writer.add_scalar("validation/final_wer", final_wer, global_step)
+
     # 최종 모델 저장
     if rank == 0:
         FINAL_MODEL_PATH.mkdir(parents=True, exist_ok=True)
         save_checkpoint(
             checkpoint_dir=FINAL_MODEL_PATH,
-            hubert=hubert,
+            hubert=hubert.module,  # DDP 래핑된 모델 대신 원본 모델 저장
             optimizer=optimizer,
             scaler=scaler,
             step=global_step,

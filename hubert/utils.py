@@ -1,4 +1,7 @@
+# hubert/utils.py
+
 import torch
+from pathlib import Path
 
 ENTROPY_THRESHOLD = 0.004  # 조기 종료 임계값
 
@@ -68,7 +71,6 @@ def wer(hyp: str, ref: str) -> float:
     ref_words = ref.strip().split()
 
     # edit distance 계산
-    # dp[i][j]: ref[:i], hyp[:j]의 편집거리
     dp = [[0]*(len(hyp_words)+1) for _ in range(len(ref_words)+1)]
 
     for i in range(len(ref_words)+1):
@@ -110,3 +112,28 @@ def should_early_exit(log_probs: torch.Tensor, threshold: float = ENTROPY_THRESH
     """
     e = compute_entropy(log_probs)
     return e < threshold
+
+def decode_predictions(pred_ids, vocab):
+    """
+    예측된 토큰 ID를 텍스트로 변환하는 함수.
+    pred_ids: numpy 배열 또는 리스트, shape (B, T)
+    vocab: dict, index to character mapping
+    """
+    decoded = []
+    for seq in pred_ids:
+        chars = [vocab.get(idx, '') for idx in seq if idx != 0]  # 0은 blank 토큰
+        decoded.append(''.join(chars))  # 공백 없이 이어붙이기 (문자 수준)
+    return decoded
+
+def load_vocab(dict_path: Path):
+    """
+    어휘 사전을 로드하는 함수.
+    dict_path: 문자 리스트 파일 경로 (각 줄에 한 문자씩)
+    반환: 인덱스-문자 매핑 딕셔너리
+    """
+    vocab = {}
+    with open(dict_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            ch = line.strip()
+            vocab[i] = ch
+    return vocab
