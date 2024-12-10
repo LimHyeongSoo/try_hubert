@@ -23,6 +23,7 @@ from hubconf import hubert_ee
 def encode_dataset(args):
     print("Loading HuBERT-EE checkpoint")
     hubert = hubert_ee(args.pretrained_path, vocab_size=args.vocab_size, ee_layers=[4,7,10]).cuda()
+    hubert.eval()  # 평가 모드로 설정
 
     print(f"Encoding dataset at {args.in_dir}")
     audio_files = list(args.in_dir.rglob(f"*{args.extension}"))
@@ -30,22 +31,21 @@ def encode_dataset(args):
         wav, sr = torchaudio.load(in_path)
         if sr != 16000:
             wav = resample(wav, sr, 16000)
-        wav = wav.unsqueeze(0).cuda() # (1,1,T)
+        wav = wav.unsqueeze(0).cuda()  # (1,1,T)
 
         with torch.no_grad():
             # 모델 forward
             # logits: final layer (B,T,vocab_size)
-            # mask: if masking used
             # all_layer_outputs: list of each layer output (B,T,D)
-            logits, mask, all_layer_outputs = hubert(wav)
+            logits, all_layer_outputs = hubert(wav)
 
             # early exit branch 로짓 계산
-            ee_logits_list = hubert.early_exit_outputs(all_layer_outputs)
-            # ee_logits_list: [logits_from_5th_layer, logits_from_8th_layer, logits_from_11th_layer] etc.
+            ee_logits_list = hubert.module.early_exit_outputs(all_layer_outputs)
+            # ee_logits_list: [logits_from_5th_layer, logits_from_8th_layer, logits_from_11th_layer] 등
 
             # Entropy 계산 후 조기 종료 결정
             # 우선 final_logits = logits, ee_logits_list[i] 별로 entropy 계산
-            # 최저 entropy branch 선택 or threshold 기반으로 첫번째 낮은 entropy branch에서 종료
+            # 최저 entropy branch 선택 또는 threshold 기반으로 첫번째 낮은 entropy branch에서 종료
             candidates = [logits] + ee_logits_list
             # candidates[0]: final logits
             # candidates[1..]: ee branch logits
@@ -57,18 +57,18 @@ def encode_dataset(args):
             for i, cand in enumerate(candidates):
                 # cand shape: (B,T,vocab_size)
                 log_probs = torch.log_softmax(cand, dim=-1)
-                entropy = compute_entropy(log_probs.unsqueeze(0)) # compute_entropy expects (B,T,C), cand already (1,T,C), so shape ok
+                entropy_val = compute_entropy(log_probs)  # compute_entropy expects (B,T,C), cand already (1,T,C), so shape ok
                 # threshold check
-                if entropy < ENTROPY_THRESHOLD:
+                if entropy_val < ENTROPY_THRESHOLD:
                     # 바로 조기 종료
                     chosen_logits = cand
                     chosen_name = f"ee_branch_{i}" if i > 0 else "final"
-                    best_entropy = entropy
+                    best_entropy = entropy_val
                     break
                 # threshold 못 넘었으면 제일 낮은 entropy인 것 선택해도 되나?
                 # 여기서는 threshold 이하 아니면 그냥 final 써도 됨.
-                if entropy < best_entropy:
-                    best_entropy = entropy
+                if entropy_val < best_entropy:
+                    best_entropy = entropy_val
                     chosen_logits = cand
                     chosen_name = f"ee_branch_{i}" if i > 0 else "final"
 
@@ -79,6 +79,9 @@ def encode_dataset(args):
             # chosen_logits: (1,T,vocab_size)
             # np.save -> cpu로
             np.save(out_path.with_suffix(".npy"), chosen_logits.squeeze(0).cpu().numpy())
+
+            # 로깅 (선택사항)
+            logging.info(f"Processed {in_path} with {chosen_name}, entropy: {best_entropy}")
 
 def main():
     parser = argparse.ArgumentParser(description="Encode an audio dataset with HuBERT-EE.")

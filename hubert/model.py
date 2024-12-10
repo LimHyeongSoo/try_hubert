@@ -38,8 +38,7 @@ class EarlyExitBranch(nn.Module):
         x = self.ffn_norm(x)
 
         logits = self.output_linear(x)  # (B, T, vocab_size)
-        probs = F.softmax(logits, dim=-1)  # Softmax 적용
-        return probs
+        return logits  # Softmax 제거
 
 
 ##############################

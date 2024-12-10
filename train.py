@@ -36,15 +36,14 @@ CHECKPOINT_INTERVAL = 5000
 BACKEND = "nccl"
 INIT_METHOD = "tcp://127.0.0.1:54321"
 
-FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final")  # 최종 모델 저장 경로
+FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final/3")  # 최종 모델 저장 경로
 
-N_EPOCHS = 5  # 고정된 에폭 수
+N_EPOCHS = 1  # 고정된 에폭 수
 
 def compute_ctc_loss(logits, targets):
     """CTC Loss 계산 함수."""
-    with torch.no_grad():
-        input_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device)
-        target_lengths = (targets != -1).sum(dim=-1)
+    input_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device)
+    target_lengths = (targets != -1).sum(dim=-1)
     log_probs = F.log_softmax(logits, dim=-1)
     loss = F.ctc_loss(
         log_probs.transpose(0, 1),
@@ -111,16 +110,16 @@ def train(rank, world_size, args):
     # 학습률 스케줄러 설정 (StepLR 사용)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)  # 2 에폭마다 학습률을 0.1배로 감소
 
-    # 데이터셋 로드
-    dict_path = args.dataset_dir / "train-clean-dict.ltr.txt"
-    tsv_path = args.dataset_dir / "tsv_file_with_nsample.tsv"
-    ltr_path = args.dataset_dir / "train-clean-100.ltr"
+    # 데이터셋 로드 (Training)
+    train_dict_path = args.dataset_dir / "train-clean-dict.ltr.txt"
+    train_tsv_path = args.dataset_dir / "tsv_file_with_nsample.tsv"
+    train_ltr_path = args.dataset_dir / "train-clean-100.ltr"
 
     train_dataset = ASRDataset(
         root=args.dataset_dir,
-        tsv_path=tsv_path,
-        ltr_path=ltr_path,
-        dict_path=dict_path,
+        tsv_path=train_tsv_path,
+        ltr_path=train_ltr_path,
+        dict_path=train_dict_path,
         train=True,
     )
     train_sampler = DistributedSampler(train_dataset, drop_last=True)
@@ -132,6 +131,29 @@ def train(rank, world_size, args):
         num_workers=8,
         pin_memory=True,
         drop_last=True,
+    )
+
+    # 데이터셋 로드 (Validation)
+    val_dict_path = args.validation_dir / "dev-clean-dict.ltr.txt"
+    val_tsv_path = args.validation_dir / "dev_tsv_file_with_nsample.tsv"
+    val_ltr_path = args.validation_dir / "dev-clean.ltr"
+
+    val_dataset = ASRDataset(
+        root=args.validation_dir,
+        tsv_path=val_tsv_path,
+        ltr_path=val_ltr_path,
+        dict_path=val_dict_path,
+        train=False,
+    )
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    val_loader = DataLoader(
+        val_dataset,
+        collate_fn=val_dataset.collate,
+        batch_size=BATCH_SIZE,
+        sampler=val_sampler,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False,
     )
 
     # 학습 준비
@@ -196,6 +218,45 @@ def train(rank, world_size, args):
                     writer.add_scalar("train/ctc_loss", train_loss_metric.value, global_step)
                     train_loss_metric.reset()
 
+            # VALIDATION_INTERVAL마다 검증 수행
+            if rank == 0 and global_step % VALIDATION_INTERVAL == 0:
+                hubert.eval()
+                val_loss_metric = Metric()
+                with torch.no_grad():
+                    for val_batch_idx, (val_wavs, val_targets) in enumerate(val_loader, 1):
+                        val_wavs, val_targets = val_wavs.to(rank), val_targets.to(rank)
+                        val_wavs = val_wavs.squeeze(1)
+
+                        _, val_all_layer_outputs = hubert(val_wavs)
+                        val_ee_logits_list = hubert.module.early_exit_outputs(val_all_layer_outputs)
+
+                        # Early Exit Branch 손실 계산
+                        val_losses = [compute_ctc_loss(logits, val_targets) for logits in val_ee_logits_list]
+                        val_total_loss = sum(val_losses) / len(val_losses)
+
+                        val_loss_metric.update(val_total_loss.item())
+
+                average_val_loss = val_loss_metric.value / len(val_loader)
+                logger.info(f"Validation at step {global_step}: Average Loss: {average_val_loss:.4f}")
+                writer.add_scalar("validation/ctc_loss", average_val_loss, global_step)
+
+                # 최적의 검증 손실 업데이트 및 체크포인트 저장
+                if average_val_loss < best_loss:
+                    best_loss = average_val_loss
+                    save_checkpoint(
+                        checkpoint_dir=FINAL_MODEL_PATH,
+                        hubert=hubert,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        step=global_step,
+                        loss=best_loss,
+                        best=True,
+                        logger=logger,
+                    )
+                    logger.info(f"Best model updated at step {global_step} with loss {best_loss:.4f}.")
+
+                hubert.train()
+
         if rank == 0:
             # 에폭이 끝난 후 학습률 스케줄러 업데이트
             scheduler.step()
@@ -219,12 +280,16 @@ def train(rank, world_size, args):
 
     dist.destroy_process_group()  # 분산 학습 종료
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Train HuBERT-EE for ASR.")
-    parser.add_argument("dataset_dir", type=Path, help="Path to the data directory.")
+    parser.add_argument("dataset_dir", type=Path, help="Path to the training data directory.")
     parser.add_argument("checkpoint_dir", type=Path, help="Path to the checkpoint directory.")
     parser.add_argument("--pretrained_path", type=Path, required=True, help="Path to the pretrained model.")
+    parser.add_argument("--validation_dir", type=Path, required=True, help="Path to the validation data directory.")
     args = parser.parse_args()
 
     world_size = torch.cuda.device_count()
     mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
+
+if __name__ == "__main__":
+    main()
