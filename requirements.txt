@@ -1,0 +1,7 @@
+numpy==2.2.0
+pydub==0.25.1
+soundfile==0.12.1
+torch==2.1.2
+torchaudio==2.1.2
+tqdm==4.66.5
+transformers==4.45.0
