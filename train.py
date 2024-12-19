@@ -23,19 +23,15 @@ from transformers import HubertForCTC
 class EEWrapper(nn.Module):
     def __init__(self, ee_branches, ee_layers):
         super().__init__()
-        # ee_branches: HubertEEModel의 early_exit_branches
-        # ee_layers: 해당 branch들이 사용하는 레이어 인덱스 리스트
         self.ee_branches = ee_branches
         self.ee_layers = ee_layers
 
     def forward(self, all_layer_outputs):
-        # all_layer_outputs는 detach된 텐서 리스트
         ee_logits_list = [
             self.ee_branches[i](all_layer_outputs[ee_idx])
             for i, ee_idx in enumerate(self.ee_layers)
         ]
         return ee_logits_list
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,8 +73,6 @@ def format_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 def calculate_wer(main_model, ee_model, dataloader, vocab, device):
-    # main_model: DDP 안걸린 hubert (hubert.hubert 포함)
-    # ee_model: DDP 걸린 EEWrapper
     main_model.eval()
     ee_model.eval()
     wer_metric = Metric()
@@ -87,10 +81,7 @@ def calculate_wer(main_model, ee_model, dataloader, vocab, device):
             wavs = wavs.to(device)
             wavs = wavs.squeeze(1)
 
-            # main model forward
-            # hubert model의 forward: (None, all_layer_outputs)
             _, all_layer_outputs = main_model(wavs)
-            # detach
             all_layer_outputs = [layer_out.detach() for layer_out in all_layer_outputs]
 
             ee_logits_list = ee_model(all_layer_outputs)
@@ -130,7 +121,6 @@ def train(rank, world_size, args):
     vocab_size = hf_model.lm_head.out_features
     ee_layers = [4, 7, 10]
 
-    # HubertEEModel 로드
     hubert = HubertEEModel.from_pretrained(
         base_model_path,
         ee_layers=ee_layers,
@@ -142,23 +132,20 @@ def train(rank, world_size, args):
     for param in hubert.hubert.parameters():
         param.requires_grad = False
 
-    # Early Exit Branch만 DDP로 감쌀 EEWrapper 생성
+    # Early Exit Branch만 DDP로 감싸기
     ee_wrapper = EEWrapper(hubert.early_exit_branches, ee_layers).to(rank)
-    # DDP 적용 (find_unused_parameters=False)
     ee_wrapper = DDP(ee_wrapper, device_ids=[rank], find_unused_parameters=False)
 
     optimizer = optim.AdamW(
-        ee_wrapper.parameters(),  # EE branch 파라미터만 옵티마이저 대상
+        ee_wrapper.parameters(),
         lr=LEARNING_RATE,
         betas=BETAS,
         eps=EPS,
         weight_decay=WEIGHT_DECAY,
     )
     scaler = amp.GradScaler()
-
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
 
-    # 데이터셋 로드
     train_dict_path = args.dataset_dir / "train-clean-dict.ltr.txt"
     train_tsv_path = args.dataset_dir / "tsv_file_with_nsample.tsv"
     train_ltr_path = args.dataset_dir / "train-clean-100.ltr"
@@ -208,15 +195,13 @@ def train(rank, world_size, args):
     start_epoch = 1
     total_batches = len(train_loader)
 
-    # hubert(hubert.hubert)는 DDP 없이 rank 디바이스로 로드한 상태로 사용
-    # forward 시 그냥 hubert(wavs) 호출 -> main model forward + all_layer_outputs 반환
     if rank == 0:
         start_time = time.time()
         batch_counter = 0
 
     for epoch in range(start_epoch, n_epochs + 1):
         train_sampler.set_epoch(epoch)
-        hubert.train()  # hubert는 grad없지만 forward는 가능
+        hubert.train()
         ee_wrapper.train()
         train_loss_metric = Metric()
 
@@ -228,9 +213,7 @@ def train(rank, world_size, args):
             optimizer.zero_grad()
 
             with amp.autocast():
-                # main model forward
                 _, all_layer_outputs = hubert(wavs)
-                # detach
                 all_layer_outputs = [layer_out.detach() for layer_out in all_layer_outputs]
 
                 ee_logits_list = ee_wrapper(all_layer_outputs)
@@ -291,10 +274,6 @@ def train(rank, world_size, args):
 
                 if average_val_loss < best_loss:
                     best_loss = average_val_loss
-                    # EE branch만 DDP 적용했으므로 ee_wrapper.module.save_state_dict() 형태로 저장하거나
-                    # hubert 상태와 ee_wrapper 상태를 함께 저장해야 할 수도 있음.
-                    # 여기서는 단순히 ee_wrapper.module 파라미터만 저장 (사실은 config 등도 필요)
-                    # 최종적으로 HuggingFace 형식으로 저장하려면 ee_branches 파라미터를 hubert에 다시 넣고 save_pretrained 등 구현 필요
                     torch.save(ee_wrapper.module.state_dict(), FINAL_MODEL_PATH / "ee_branches.pt")
                     logger.info(f"Best model updated at step {global_step} with loss {best_loss:.4f}.")
 
@@ -311,9 +290,18 @@ def train(rank, world_size, args):
         logger.info(f"Final WER after training: {final_wer:.2f}%")
         writer.add_scalar("validation/final_wer", final_wer, global_step)
 
-        # 최종적으로 EE branch 파라미터만 저장. 필요시 HuggingFace 형식에 맞게 추가 구현.
+        # 최종 EE branch 파라미터 저장
         torch.save(ee_wrapper.module.state_dict(), FINAL_MODEL_PATH / "ee_branches_final.pt")
         logger.info(f"Final EE branch checkpoint saved to {FINAL_MODEL_PATH}.")
+
+        # 여기서 ee_branches_final.pt를 로드하여 hubert 모델에 반영
+        ee_state_dict = torch.load(FINAL_MODEL_PATH / "ee_branches_final.pt", map_location="cpu")
+        hubert.early_exit_branches.load_state_dict(ee_state_dict)
+
+        # 이제 hubert 모델에 EE branch 파라미터 반영 완료
+        # Hugging Face 형식으로 safetensors 저장
+        hubert.save_pretrained(FINAL_MODEL_PATH, safe_serialization=True)
+        logger.info(f"Hugging Face format model saved to {FINAL_MODEL_PATH}.")
 
     dist.destroy_process_group()
 
