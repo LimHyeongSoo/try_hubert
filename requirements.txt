@@ -5,3 +5,5 @@ torch==2.1.2
 torchaudio==2.1.2
 tqdm==4.66.5
 transformers==4.45.0
+tensorboard==2.18.0
+tensorboard-data-server==0.7.2
