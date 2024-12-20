@@ -69,6 +69,6 @@ python train.py \
    - `--validation_dir`: 검증 데이터가 위치한 디렉토리 (예: `/data3/hslim/PycharmProjects/try_hubert/DB/LibriSpeech`)
 
 위 설정들을 통해 `train.py`를 실행하면 지정된 GPU 장치를 활용하여 사전 학습 모델을 기반으로 음성 데이터에 대한 학습 및 검증을 수행할 수 있습니다.
-
+```
 ## Author
 Lim HyeongSoo
