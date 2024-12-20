@@ -31,7 +31,7 @@ pip install -r requirements.txt
 ## 실행 방법
 `run_train.sh` 파일을 실행하여 학습을 시작할 수 있습니다:
 ```bash
-bash run_train.sh
+./run_train.sh
 ```
 
 ### `run_train.sh` 내용
