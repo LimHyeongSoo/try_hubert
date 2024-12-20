@@ -26,7 +26,8 @@ pip install -r requirements.txt
 
 ### 데이터셋 변환
 - **TSV 파일 변환**: `DB` 디렉토리 내의 `make_tsv.py`와 `fix_tsv.py` 파일 사용하여 데이터셋을 변환할 수 있습니다.
-- **스크립트 파일 변환**: `make_ltr.py`와 `make_ltr_dict.py` 파일을 사용하여 변환 작업을 수행할 수 있습니다.
+- **스크립트 파일 변환**: `make_ltr.py` 파일을 사용하여 변환 작업을 수행할 수 있습니다.
+- **최종적으로 .tsv 파일과 .ltr 파일만 사용됩니다!!!**
 
 ## 실행 방법
 `run_train.sh` 파일을 실행하여 학습을 시작할 수 있습니다:
