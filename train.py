@@ -2,6 +2,7 @@ import argparse
 import logging
 from pathlib import Path
 import time
+import random
 
 import torch
 import torch.cuda.amp as amp
@@ -16,9 +17,9 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from hubert.dataset import ASRDataset
-from hubert.utils import Metric, wer, decode_predictions, load_vocab
-from hubert.model import HubertEEModel
-from transformers import HubertForCTC
+from hubert.utils import Metric, wer
+from hubert.model import HubertEEModel,HubertConfig
+from transformers import HubertForCTC, Wav2Vec2CTCTokenizer
 
 class EEWrapper(nn.Module):
     def __init__(self, ee_branches, ee_layers):
@@ -37,7 +38,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 하이퍼파라미터 및 설정
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 LEARNING_RATE = 2e-6
 BETAS = (0.9, 0.98)
 EPS = 1e-06
@@ -45,16 +46,16 @@ WEIGHT_DECAY = 1e-2
 MAX_NORM = 10
 LOG_INTERVAL = 5
 VALIDATION_INTERVAL = 1000
-CHECKPOINT_INTERVAL = 5000
 BACKEND = "nccl"
 INIT_METHOD = "tcp://127.0.0.1:54321"
 
-FINAL_MODEL_PATH = Path("/data1/hslim/PycharmProjects/hubert/final/1")
+FINAL_MODEL_PATH = Path("/data3/hslim/PycharmProjects/try_hubert/final/2")
+FINAL_MODEL_PATH.mkdir(parents=True, exist_ok=True)  # 디렉토리 자동 생성
 N_EPOCHS = 1
 
 def compute_ctc_loss(logits, targets):
     input_lengths = torch.full((logits.size(0),), logits.size(1), dtype=torch.long, device=logits.device)
-    target_lengths = (targets != -1).sum(dim=-1)
+    target_lengths = (targets != 0).sum(dim=-1)  # blank=0 토큰 제외 실제 길이
     log_probs = F.log_softmax(logits, dim=-1)
     loss = F.ctc_loss(
         log_probs.transpose(0, 1),
@@ -72,33 +73,46 @@ def format_time(seconds):
     secs = int(seconds % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
-def calculate_wer(main_model, ee_model, dataloader, vocab, device):
+def decode_predictions(pred_ids, tokenizer):
+    pred_texts = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    return pred_texts
+
+def calculate_wer(main_model, ee_model, dataloader, tokenizer, device, collect_samples=False):
     main_model.eval()
     ee_model.eval()
     wer_metric = Metric()
+    collected_samples = []
+
     with torch.no_grad():
         for batch_idx, (wavs, targets, transcripts) in enumerate(dataloader, 1):
             wavs = wavs.to(device)
-            wavs = wavs.squeeze(1)
 
-            _, all_layer_outputs = main_model(wavs)
+            # forward
+            outputs = main_model(wavs)
+            all_layer_outputs = outputs.hidden_states[1:]  # 첫번째는 feature extractor output
             all_layer_outputs = [layer_out.detach() for layer_out in all_layer_outputs]
 
             ee_logits_list = ee_model(all_layer_outputs)
             logits = ee_logits_list[-1]
-            pred_ids = torch.argmax(logits, dim=-1).cpu().numpy()
+            pred_ids = torch.argmax(logits, dim=-1).cpu()
 
-            pred_texts = decode_predictions(pred_ids, vocab)
+            pred_texts = decode_predictions(pred_ids, tokenizer)
             target_texts = transcripts
 
             for pred, ref in zip(pred_texts, target_texts):
                 wer_value = wer(pred, ref)
                 wer_metric.update(wer_value)
+                if collect_samples:
+                    collected_samples.append((pred, ref))
 
     average_wer = wer_metric.value / wer_metric.steps if wer_metric.steps > 0 else 0.0
-    return average_wer
+    random_samples = []
+    if collect_samples and len(collected_samples) > 0:
+        random_samples = random.sample(collected_samples, min(5, len(collected_samples)))
 
-def train(rank, world_size, args):
+    return average_wer, random_samples
+
+def train(rank, world_size, args, tokenizer):
     dist.init_process_group("nccl", rank=rank, world_size=world_size, init_method=INIT_METHOD)
 
     log_dir = args.checkpoint_dir / "logs"
@@ -115,24 +129,27 @@ def train(rank, world_size, args):
         logger.setLevel(logging.ERROR)
 
     writer = SummaryWriter(log_dir) if rank == 0 else None
-
     base_model_path = str(args.pretrained_path)
     hf_model = HubertForCTC.from_pretrained(base_model_path)
     vocab_size = hf_model.lm_head.out_features
     ee_layers = [4, 7, 10]
 
+    config = HubertConfig.from_pretrained(base_model_path)
+    config.output_hidden_states = True
+    config.return_dict = True
+
     hubert = HubertEEModel.from_pretrained(
         base_model_path,
+        config=config,
         ee_layers=ee_layers,
         ee_dim=1024,
-        ee_vocab_size=vocab_size,
+        ee_vocab_size=vocab_size
     ).to(rank)
 
     # 메인 모델 파라미터 Freeze
     for param in hubert.hubert.parameters():
         param.requires_grad = False
 
-    # Early Exit Branch만 DDP로 감싸기
     ee_wrapper = EEWrapper(hubert.early_exit_branches, ee_layers).to(rank)
     ee_wrapper = DDP(ee_wrapper, device_ids=[rank], find_unused_parameters=False)
 
@@ -146,14 +163,14 @@ def train(rank, world_size, args):
     scaler = amp.GradScaler()
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)
 
-    train_dict_path = args.dataset_dir / "train-clean-dict.ltr.txt"
-    train_tsv_path = args.dataset_dir / "tsv_file_with_nsample.tsv"
+    # Dataset
+    train_tsv_path = args.dataset_dir / "train_tsv_file_with_nsample.tsv"
     train_ltr_path = args.dataset_dir / "train-clean-100.ltr"
     train_dataset = ASRDataset(
         root=args.dataset_dir,
         tsv_path=train_tsv_path,
         ltr_path=train_ltr_path,
-        dict_path=train_dict_path,
+        tokenizer=tokenizer,
         train=True,
     )
     train_sampler = DistributedSampler(train_dataset, drop_last=True)
@@ -167,14 +184,13 @@ def train(rank, world_size, args):
         drop_last=True,
     )
 
-    val_dict_path = args.validation_dir / "dev-clean-dict.ltr.txt"
     val_tsv_path = args.validation_dir / "dev_tsv_file_with_nsample.tsv"
     val_ltr_path = args.validation_dir / "dev-clean.ltr"
     val_dataset = ASRDataset(
         root=args.validation_dir,
         tsv_path=val_tsv_path,
         ltr_path=val_ltr_path,
-        dict_path=val_dict_path,
+        tokenizer=tokenizer,
         train=False,
     )
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -187,8 +203,6 @@ def train(rank, world_size, args):
         pin_memory=True,
         drop_last=False,
     )
-
-    vocab = load_vocab(val_dict_path)
 
     global_step, best_loss = 0, float("inf")
     n_epochs = N_EPOCHS
@@ -208,12 +222,12 @@ def train(rank, world_size, args):
         for batch_idx, (wavs, targets, _) in enumerate(train_loader, 1):
             global_step += 1
             wavs, targets = wavs.to(rank), targets.to(rank)
-            wavs = wavs.squeeze(1)
 
             optimizer.zero_grad()
 
             with amp.autocast():
-                _, all_layer_outputs = hubert(wavs)
+                outputs = hubert(wavs)
+                all_layer_outputs = outputs.hidden_states[1:]
                 all_layer_outputs = [layer_out.detach() for layer_out in all_layer_outputs]
 
                 ee_logits_list = ee_wrapper(all_layer_outputs)
@@ -240,7 +254,7 @@ def train(rank, world_size, args):
                 logger.info(
                     f"Epoch [{epoch}/{n_epochs}] Batch [{batch_idx}/{total_batches}] | "
                     f"Time: {current_time_str} | Remaining Time: {formatted_remaining_time} | "
-                    f"Loss: {total_loss.item():.4f} | LR: {current_lr:.6f}"
+                    f"Loss: {total_loss.item():.6f} | LR: {current_lr:.6f}"
                 )
 
                 if global_step % LOG_INTERVAL == 0:
@@ -254,9 +268,9 @@ def train(rank, world_size, args):
                 with torch.no_grad():
                     for val_batch_idx, (val_wavs, val_targets, _) in enumerate(val_loader, 1):
                         val_wavs, val_targets = val_wavs.to(rank), val_targets.to(rank)
-                        val_wavs = val_wavs.squeeze(1)
 
-                        _, val_all_layer_outputs = hubert(val_wavs)
+                        outputs = hubert(val_wavs)
+                        val_all_layer_outputs = outputs.hidden_states[1:]
                         val_all_layer_outputs = [layer_out.detach() for layer_out in val_all_layer_outputs]
                         val_ee_logits_list = ee_wrapper(val_all_layer_outputs)
 
@@ -265,17 +279,12 @@ def train(rank, world_size, args):
                         val_loss_metric.update(val_total_loss.item())
 
                 average_val_loss = val_loss_metric.value / len(val_loader)
-                logger.info(f"Validation at step {global_step}: Average Loss: {average_val_loss:.4f}")
+                logger.info(f"Validation at step {global_step}: Average Loss: {average_val_loss:.6f}")
                 writer.add_scalar("validation/ctc_loss", average_val_loss, global_step)
 
-                wer_value = calculate_wer(hubert, ee_wrapper, val_loader, vocab, rank)
-                logger.info(f"Validation at step {global_step}: WER: {wer_value:.2f}%")
-                writer.add_scalar("validation/wer", wer_value, global_step)
-
-                if average_val_loss < best_loss:
-                    best_loss = average_val_loss
-                    torch.save(ee_wrapper.module.state_dict(), FINAL_MODEL_PATH / "ee_branches.pt")
-                    logger.info(f"Best model updated at step {global_step} with loss {best_loss:.4f}.")
+                val_wer, _ = calculate_wer(hubert, ee_wrapper, val_loader, tokenizer, rank, collect_samples=False)
+                logger.info(f"Validation at step {global_step}: WER: {val_wer:.6f}%")
+                writer.add_scalar("validation/wer", val_wer, global_step)
 
                 hubert.train()
                 ee_wrapper.train()
@@ -283,25 +292,22 @@ def train(rank, world_size, args):
         if rank == 0:
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
-            logger.info(f"Epoch [{epoch}/{n_epochs}] completed. Average Loss: {train_loss_metric.value:.4f} | LR: {current_lr:.6f}")
+            logger.info(f"Epoch [{epoch}/{n_epochs}] completed. Average Loss: {train_loss_metric.value:.6f} | LR: {current_lr:.6f}")
 
     if rank == 0:
-        final_wer = calculate_wer(hubert, ee_wrapper, val_loader, vocab, rank)
-        logger.info(f"Final WER after training: {final_wer:.2f}%")
+        final_wer, samples = calculate_wer(hubert, ee_wrapper, val_loader, tokenizer, rank, collect_samples=True)
+        logger.info(f"Final WER after training: {final_wer * 100:.2f}%")
         writer.add_scalar("validation/final_wer", final_wer, global_step)
 
-        # 최종 EE branch 파라미터 저장
-        torch.save(ee_wrapper.module.state_dict(), FINAL_MODEL_PATH / "ee_branches_final.pt")
-        logger.info(f"Final EE branch checkpoint saved to {FINAL_MODEL_PATH}.")
+        # Random Samples 로깅 부분 제거됨
 
-        # 여기서 ee_branches_final.pt를 로드하여 hubert 모델에 반영
-        ee_state_dict = torch.load(FINAL_MODEL_PATH / "ee_branches_final.pt", map_location="cpu")
-        hubert.early_exit_branches.load_state_dict(ee_state_dict)
+        # 토크나이저를 FINAL_MODEL_PATH에 저장
+        tokenizer.save_pretrained(FINAL_MODEL_PATH)
 
-        # 이제 hubert 모델에 EE branch 파라미터 반영 완료
-        # Hugging Face 형식으로 safetensors 저장
+        # 모델도 저장
+        hubert.config._name_or_path = str(FINAL_MODEL_PATH)
         hubert.save_pretrained(FINAL_MODEL_PATH, safe_serialization=True)
-        logger.info(f"Hugging Face format model saved to {FINAL_MODEL_PATH}.")
+        logger.info(f"Model and tokenizer saved in {FINAL_MODEL_PATH}")
 
     dist.destroy_process_group()
 
@@ -313,8 +319,10 @@ def main():
     parser.add_argument("--validation_dir", type=Path, required=True, help="Path to the validation data directory.")
     args = parser.parse_args()
 
+    tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(str(args.pretrained_path))
+
     world_size = torch.cuda.device_count()
-    mp.spawn(train, args=(world_size, args), nprocs=world_size, join=True)
+    mp.spawn(train, args=(world_size, args, tokenizer), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     main()

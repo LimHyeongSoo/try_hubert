@@ -42,12 +42,10 @@ class HubertEEConfig(HubertConfig):
         self.ee_vocab_size = ee_vocab_size
 
 class HubertEEModel(HubertForCTC):
-    """
-    메인 logits를 사용하지 않고, Early Exit Branch만 사용.
-    """
     def __init__(self, config: HubertEEConfig):
         super().__init__(config)
         self.config.output_hidden_states = True
+        self.config.return_dict = True
 
         self.ee_layers = config.ee_layers
         self.early_exit_branches = nn.ModuleList([
@@ -64,19 +62,13 @@ class HubertEEModel(HubertForCTC):
         self.init_weights()
 
     def forward(self, input_values, attention_mask=None, **kwargs):
-        # HubertForCTC의 forward 호출. 여기서 logits도 나오지만 사용하지 않을 것임.
+        # 여기서 output_hidden_states=True, return_dict=True를 제거
         outputs = super().forward(
             input_values=input_values,
             attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True,
             **kwargs
         )
-        # outputs.hidden_states: (feature_extractor_out, layer_1_out, layer_2_out, ...)
-        # transformer 레이어 출력은 index 1부터 시작하므로 [1:]
-        all_layer_outputs = outputs.hidden_states[1:]
-        # 메인 logits 반환하지 않고, all_layer_outputs만 반환
-        return None, all_layer_outputs
+        return outputs
 
     def early_exit_outputs(self, all_layer_outputs):
         ee_logits_list = [
@@ -86,10 +78,21 @@ class HubertEEModel(HubertForCTC):
         return ee_logits_list
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, ee_layers=[4,7,10], ee_dim=1024, ee_vocab_size=50, **kwargs):
-        config = HubertEEConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        config.ee_layers = ee_layers
-        config.ee_dim = ee_dim
-        config.ee_vocab_size = ee_vocab_size
-        model = super(HubertEEModel, cls).from_pretrained(pretrained_model_name_or_path, *model_args, config=config, **kwargs)
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, ee_layers=None, ee_dim=None,
+                        ee_vocab_size=None, **kwargs):
+        config = kwargs.pop("config", None)
+        if config is not None:
+            config.ee_layers = ee_layers
+            config.ee_dim = ee_dim
+            config.ee_vocab_size = ee_vocab_size
+
+        if config is not None:
+            kwargs["config"] = config
+
+        model = super(HubertEEModel, cls).from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            **kwargs
+        )
+
         return model

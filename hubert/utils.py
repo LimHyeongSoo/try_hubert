@@ -3,7 +3,7 @@
 import torch
 from pathlib import Path
 
-ENTROPY_THRESHOLD = 0.004  # 조기 종료 임계값
+ENTROPY_THRESHOLD = 0.005  # 조기 종료 임계값
 
 class Metric:
     def __init__(self):
@@ -101,9 +101,8 @@ def compute_entropy(log_probs: torch.Tensor) -> float:
     여기서 log_probs는 log p(t,c) 형태
     """
     with torch.no_grad():
-        probs = log_probs.exp()  # (B,T,C)
-        entropy = -(probs * log_probs).sum(dim=-1).mean(dim=-1) # (B,)
-        # 여기서는 batch 평균 entropy 반환
+        probs = log_probs.softmax(dim=-1)  # 안정적인 softmax
+        entropy = -(probs * log_probs).sum(dim=-1).mean(dim=-1)
         return entropy.mean().item()
 
 def should_early_exit(log_probs: torch.Tensor, threshold: float = ENTROPY_THRESHOLD) -> bool:
