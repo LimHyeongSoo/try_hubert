@@ -55,12 +55,14 @@ python train.py \
 ```
 
 위 스크립트는 다음 작업을 수행합니다:
-1. **GPU 설정**: `CUDA_VISIBLE_DEVICES=0,1`을 통해 0번과 1번 GPU를 사용하도록 설정합니다.
-2. **학습 스크립트 실행**: `train.py` 스크립트를 실행하며 다음과 같은 매개변수를 전달합니다:
-   - `/LibriSpeech`: 학습 데이터 경로
-   - `/checkpoints`: 체크포인트를 저장할 경로
-   - `--pretrained_path`: 사전 학습된 모델 경로
-   - `--validation_dir`: 검증 데이터 경로
+	•	GPU 설정:
+CUDA_VISIBLE_DEVICES=0,1,2,3를 통해 0번, 1번, 2번, 3번 GPU를 사용하도록 설정합니다.
+	•	학습 스크립트 실행:
+train.py 스크립트를 실행하며 다음 매개변수를 전달합니다:
+	•	/LibriSpeech : 학습 데이터가 위치한 디렉토리
+	•	/checkpoints : 체크포인트를 저장할 디렉토리
+	•	--pretrained_path : 사전 학습된 모델(토크나이저 포함)이 위치한 경로
+	•	--validation_dir : 검증 데이터가 위치한 디렉토리
 
 ## Author
 Lim HyeongSoo
