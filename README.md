@@ -54,15 +54,21 @@ python train.py \
     --validation_dir $VALIDATION_DIR
 ```
 
-위 스크립트는 다음 작업을 수행합니다:
-	•	GPU 설정:
-CUDA_VISIBLE_DEVICES=0,1,2,3를 통해 0번, 1번, 2번, 3번 GPU를 사용하도록 설정합니다.
-	•	학습 스크립트 실행:
-train.py 스크립트를 실행하며 다음 매개변수를 전달합니다:
-	•	/LibriSpeech : 학습 데이터가 위치한 디렉토리
-	•	/checkpoints : 체크포인트를 저장할 디렉토리
-	•	--pretrained_path : 사전 학습된 모델(토크나이저 포함)이 위치한 경로
-	•	--validation_dir : 검증 데이터가 위치한 디렉토리
+## 스크립트 설명
+```
+위의 스크립트(`train.sh` 예시)는 다음 작업을 수행합니다:
+
+1. **GPU 설정**:  
+   `CUDA_VISIBLE_DEVICES=0,1,2,3`를 통해 0번, 1번, 2번, 3번 GPU를 사용하도록 설정합니다.
+
+2. **학습 스크립트 실행**:  
+   `train.py` 스크립트를 실행하며 다음과 같은 매개변수를 전달합니다.
+   - `DATASET_DIR`: 학습 데이터가 위치한 디렉토리 (예: `/data3/hslim/PycharmProjects/try_hubert/DB/LibriSpeech`)
+   - `CHECKPOINT_DIR`: 체크포인트를 저장할 디렉토리 (예: `/data3/hslim/PycharmProjects/try_hubert/checkpoints`)
+   - `--pretrained_path`: 사전 학습된 모델(토크나이저 포함)이 위치한 경로 (예: `/data3/hslim/PycharmProjects/try_hubert/models`)
+   - `--validation_dir`: 검증 데이터가 위치한 디렉토리 (예: `/data3/hslim/PycharmProjects/try_hubert/DB/LibriSpeech`)
+
+위 설정들을 통해 `train.py`를 실행하면 지정된 GPU 장치를 활용하여 사전 학습 모델을 기반으로 음성 데이터에 대한 학습 및 검증을 수행할 수 있습니다.
 
 ## Author
 Lim HyeongSoo
